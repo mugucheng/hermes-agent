@@ -2,6 +2,10 @@
 
 Instructions for AI coding assistants and developers working on the hermes-agent codebase.
 
+## 🔤 输出语言规则
+- **禁止输出 Unicode 转义序列**（如 `\u3010`、`\u8d28\u68c0` 等），所有中文内容必须直接输出 UTF-8 字符
+- 无论是写入文件还是对用户的消息回复，都必须遵守此规则
+
 ## Development Environment
 
 ```bash
