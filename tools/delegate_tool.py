@@ -22,6 +22,7 @@ import logging
 
 logger = logging.getLogger(__name__)
 import os
+from pathlib import Path
 import threading
 import time
 from concurrent.futures import (
@@ -574,6 +575,7 @@ def _build_child_system_prompt(
     role: str = "leaf",
     max_spawn_depth: int = 2,
     child_depth: int = 1,
+    profile_agents_md: Optional[str] = None,
 ) -> str:
     """Build a focused system prompt for a child agent.
 
@@ -582,12 +584,26 @@ def _build_child_system_prompt(
     inspiration/openclaw/src/agents/subagent-system-prompt.ts:63-95).
     The depth note is literal truth (grounded in the passed config) so
     the LLM doesn't confabulate nesting capabilities that don't exist.
+
+    When profile_agents_md is provided (from a profile's AGENTS.md),
+    it is injected at the top of the prompt so the child agent follows
+    the profile's behavior rules and identity.
     """
-    parts = [
+    parts = []
+    # Inject profile AGENTS.md at the top when a profile is active
+    if profile_agents_md and profile_agents_md.strip():
+        parts.append(
+            "# Profile Instructions (from AGENTS.md)\n"
+            "You are running under a specific Hermes profile. "
+            "Follow ALL instructions below as your primary behavior rules:\n\n"
+            f"{profile_agents_md.strip()}\n\n"
+            "---\n"
+        )
+    parts.extend([
         "You are a focused subagent working on a specific delegated task.",
         "",
         f"YOUR TASK:\n{goal}",
-    ]
+    ])
     if context and context.strip():
         parts.append(f"\nCONTEXT:\n{context}")
     if workspace_path and str(workspace_path).strip():
@@ -888,6 +904,12 @@ def _build_child_agent(
     # 'leaf' (default) cannot; 'orchestrator' retains the delegation
     # toolset subject to depth/kill-switch bounds applied below.
     role: str = "leaf",
+    # Optional Hermes profile name to run the child agent under.
+    # When set, resolves the profile directory, applies a thread-safe
+    # HERMES_HOME override via set_hermes_home_override (ContextVar),
+    # loads the profile's .env, config.yaml, and AGENTS.md so the child
+    # inherits that profile's identity, tools, and provider configuration.
+    profile: Optional[str] = None,
 ):
     """
     Build a child AIAgent on the main thread (thread-safe construction).
@@ -895,11 +917,78 @@ def _build_child_agent(
 
     When override_* params are set (from delegation config), the child uses
     those credentials instead of inheriting from the parent.  This enables
-    routing subagents to a different provider:model pair (e.g. cheap/fast
+    and provider:model pair (e.g. cheap/fast
     model on OpenRouter while the parent runs on Nous Portal).
     """
     from run_agent import AIAgent
     import uuid as _uuid
+
+    # ── Profile resolution (main-thread only, thread-safe) ────────────
+    # When profile is specified, resolve the profile directory, apply
+    # HERMES_HOME override (ContextVar), load profile .env, and read
+    # profile AGENTS.md for injection into the child system prompt.
+    # All of this runs on the main thread before any child is dispatched
+    # to ThreadPoolExecutor, so there is no race condition.
+    _profile_dir = None
+    _profile_agents_md = None
+    _saved_env_keys = {}  # track .env vars we set so we can clean up
+    _hermes_home_token = None  # ContextVar token for restore
+
+    if profile:
+        try:
+            from hermes_constants import (
+                set_hermes_home_override,
+                get_hermes_home,
+            )
+            from hermes_cli.profiles import normalize_profile_name
+
+            normalized = normalize_profile_name(profile)
+            if normalized:
+                profile_base = Path(get_hermes_home()) / "profiles" / normalized
+                if profile_base.is_dir():
+                    _profile_dir = profile_base
+                    # Apply HERMES_HOME override — ContextVar, thread-safe
+                    # Save the token so we can restore after child construction
+                    _hermes_home_token = set_hermes_home_override(str(profile_base))
+
+                    # Load profile .env (temporary, restored after construction)
+                    profile_env_file = profile_base / ".env"
+                    if profile_env_file.is_file():
+                        import dotenv
+                        _saved_env_keys = {
+                            k: os.environ.get(k)
+                            for k in dotenv.dotenv_values(profile_env_file)
+                        }
+                        dotenv.load_dotenv(profile_env_file, override=True)
+
+                    # Read profile AGENTS.md for system prompt injection
+                    profile_agents = profile_base / "AGENTS.md"
+                    if profile_agents.is_file():
+                        _profile_agents_md = profile_agents.read_text(
+                            encoding="utf-8"
+                        )
+
+                    logger.info(
+                        "delegate_task: profile '%s' resolved → %s",
+                        profile, profile_base,
+                    )
+                else:
+                    logger.warning(
+                        "delegate_task: profile '%s' dir not found at %s, "
+                        "proceeding without profile override",
+                        profile, profile_base,
+                    )
+            else:
+                logger.warning(
+                    "delegate_task: could not normalize profile name '%s', "
+                    "proceeding without profile override",
+                    profile,
+                )
+        except Exception as exc:
+            logger.warning(
+                "delegate_task: profile resolution failed for '%s': %s",
+                profile, exc,
+            )
 
     # ── Role resolution ─────────────────────────────────────────────────
     # Honor the caller's role only when BOTH the kill switch and the
@@ -975,6 +1064,7 @@ def _build_child_agent(
         role=effective_role,
         max_spawn_depth=max_spawn,
         child_depth=child_depth,
+        profile_agents_md=_profile_agents_md,
     )
     # Extract parent's API key so subagents inherit auth (e.g. Nous Portal).
     parent_api_key = getattr(parent_agent, "api_key", None)
@@ -1170,6 +1260,25 @@ def _build_child_agent(
             child_progress_cb("subagent.spawn_requested", preview=goal)
         except Exception as exc:
             logger.debug("spawn_requested relay failed: %s", exc)
+
+    # ── Restore environment after profile override ────────────────────
+    # Reset HERMES_HOME ContextVar using the saved token so the next child
+    # in a batch loop sees the original home.  The child agent that was
+    # just built captured its own HERMES_HOME at construction time.
+    if _hermes_home_token is not None:
+        try:
+            from hermes_constants import reset_hermes_home_override
+            reset_hermes_home_override(_hermes_home_token)
+        except Exception:
+            pass
+    # Restore os.environ vars from profile .env so the next child
+    # construction in the loop (batch mode) doesn't inherit stale values.
+    if _saved_env_keys:
+        for k, old_v in _saved_env_keys.items():
+            if old_v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = old_v
 
     return child
 
@@ -1924,6 +2033,7 @@ def delegate_task(
     acp_command: Optional[str] = None,
     acp_args: Optional[List[str]] = None,
     role: Optional[str] = None,
+    profile: Optional[str] = None,
     parent_agent=None,
 ) -> str:
     """
@@ -2080,6 +2190,8 @@ def delegate_task(
                     else (acp_args if acp_args is not None else creds.get("args"))
                 ),
                 role=effective_role,
+                # Per-task profile beats top-level; fallback to top-level profile.
+                profile=t.get("profile") or profile,
             )
             # Override with correct parent tool names (before child construction mutated global)
             child._delegate_saved_tool_names = _parent_tool_names
@@ -2703,6 +2815,17 @@ DELEGATE_TASK_SCHEMA = {
                     "['terminal', 'file', 'web'] for full-stack tasks."
                 ),
             },
+            "profile": {
+                "type": "string",
+                "description": (
+                    "Optional Hermes profile name to run the subagent under. "
+                    "When set, the scheduler resolves that profile, applies a context-local "
+                    "Hermes home override, and loads the profile directory's config.yaml, .env, "
+                    "and AGENTS.md so the child agent runs with that profile's identity, tools, "
+                    "and provider configuration. Named profiles must already exist. "
+                    "On update, pass an empty string to clear."
+                ),
+            },
             "tasks": {
                 "type": "array",
                 "items": {
@@ -2717,6 +2840,14 @@ DELEGATE_TASK_SCHEMA = {
                             "type": "array",
                             "items": {"type": "string"},
                             "description": f"Toolsets for this specific task. Available: {_TOOLSET_LIST_STR}. Use 'web' for network access, 'terminal' for shell, 'browser' for web interaction.",
+                        },
+                        "profile": {
+                            "type": "string",
+                            "description": (
+                                "Per-task profile override. When set, this task's subagent "
+                                "runs under the specified Hermes profile instead of the "
+                                "top-level profile (if any). Profile must already exist."
+                            ),
                         },
                         "acp_command": {
                             "type": "string",
@@ -2793,6 +2924,7 @@ registry.register(
         acp_command=args.get("acp_command"),
         acp_args=args.get("acp_args"),
         role=args.get("role"),
+        profile=args.get("profile"),
         parent_agent=kw.get("parent_agent"),
     ),
     check_fn=check_delegate_requirements,
