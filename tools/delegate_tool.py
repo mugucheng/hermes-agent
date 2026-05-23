@@ -1001,6 +1001,72 @@ def _build_child_agent(
     orchestrator_ok = _get_orchestrator_enabled() and child_depth < max_spawn
     effective_role = role if (role == "orchestrator" and orchestrator_ok) else "leaf"
 
+    # ── Profile model fallback ──────────────────────────────────────────
+    # When no model was specified (neither by caller nor delegation config),
+    # but a profile is active with model.default + model.provider in its
+    # config.yaml, use those as the child's model and provider credentials.
+    # This lets delegate_task(profile="X") automatically pick up the
+    # profile's default model without needing an explicit model parameter.
+    if model is None and _profile_dir is not None:
+        try:
+            profile_config_path = _profile_dir / "config.yaml"
+            if profile_config_path.is_file():
+                import yaml
+                with open(profile_config_path, "r", encoding="utf-8") as _pcf:
+                    _pcfg = yaml.safe_load(_pcf) or {}
+                _pm = _pcfg.get("model", {})
+                _profile_default_model = str(_pm.get("default", "") or "").strip() or None
+                _profile_provider = str(_pm.get("provider", "") or "").strip() or None
+                if _profile_default_model:
+                    model = _profile_default_model
+                    logger.info(
+                        "delegate_task: profile model fallback → model=%s (from profile config)",
+                        model,
+                    )
+                    if _profile_provider:
+                        # Resolve credentials for the profile's provider
+                        try:
+                            from hermes_cli.runtime_provider import resolve_runtime_provider
+                            _prt = resolve_runtime_provider(
+                                requested=_profile_provider,
+                                target_model=_profile_default_model,
+                            )
+                            _prt_key = _prt.get("api_key", "")
+                            if _prt_key:
+                                override_provider = (
+                                    _profile_provider
+                                    if _prt.get("provider") == _RUNTIME_PROVIDER_CUSTOM
+                                    else _prt.get("provider")
+                                )
+                                override_base_url = _prt.get("base_url")
+                                override_api_key = _prt_key
+                                override_api_mode = _prt.get("api_mode")
+                                logger.info(
+                                    "delegate_task: profile provider fallback → provider=%s",
+                                    override_provider,
+                                )
+                        except Exception:
+                            # Fallback: try custom provider alias
+                            _pc = _resolve_custom_provider(_profile_provider)
+                            if _pc and _pc.get("api_key"):
+                                override_provider = _pc.get("provider", "custom")
+                                override_base_url = _pc.get("base_url")
+                                override_api_key = _pc["api_key"]
+                                override_api_mode = _pc.get("api_mode")
+                                logger.info(
+                                    "delegate_task: profile provider fallback → provider=%s (custom alias)",
+                                    override_provider,
+                                )
+                            else:
+                                logger.warning(
+                                    "delegate_task: profile provider '%s' resolution failed (not built-in, not in config.yaml)",
+                                    _profile_provider,
+                                )
+        except Exception as _pme:
+            logger.warning(
+                "delegate_task: profile model fallback failed: %s", _pme,
+            )
+
     # ── Subagent identity (stable across events, 0-indexed for TUI) ─────
     # subagent_id is generated here so the progress callback, the
     # spawn_requested event, and the _active_subagents registry all share
@@ -2034,6 +2100,7 @@ def delegate_task(
     acp_args: Optional[List[str]] = None,
     role: Optional[str] = None,
     profile: Optional[str] = None,
+    model: Optional[str] = None,
     parent_agent=None,
 ) -> str:
     """
@@ -2107,6 +2174,70 @@ def delegate_task(
     except ValueError as exc:
         return tool_error(str(exc))
 
+    # Resolve model parameter: allows LLM to specify provider/model at call time.
+    # Format: "provider/model" (e.g. "bigmodel/glm-5-turbo") or just "model-name".
+    # Takes precedence over delegation config and profile defaults.
+    _caller_model = (model or "").strip() or None
+    if _caller_model:
+        if "/" in _caller_model:
+            _provider_part, _model_part = _caller_model.split("/", 1)
+            _provider_part = _provider_part.strip()
+            _model_part = _model_part.strip()
+        else:
+            _provider_part = None
+            _model_part = _caller_model
+
+        if _provider_part:
+            # Resolve full credentials for the specified provider
+            try:
+                from hermes_cli.runtime_provider import resolve_runtime_provider
+                _runtime = resolve_runtime_provider(
+                    requested=_provider_part, target_model=_model_part
+                )
+                _resolved_api_key = _runtime.get("api_key", "")
+                if not _resolved_api_key:
+                    return tool_error(
+                        f"Model parameter provider '{_provider_part}' resolved but has no API key. "
+                        f"Set the appropriate environment variable or run 'hermes auth'."
+                    )
+                creds = {
+                    "model": _model_part or _runtime.get("model") or creds.get("model"),
+                    "provider": (
+                        _provider_part
+                        if _runtime.get("provider") == _RUNTIME_PROVIDER_CUSTOM
+                        else _runtime.get("provider")
+                    ),
+                    "base_url": _runtime.get("base_url"),
+                    "api_key": _resolved_api_key,
+                    "api_mode": _runtime.get("api_mode"),
+                    "command": _runtime.get("command"),
+                    "args": list(_runtime.get("args") or []),
+                }
+            except Exception:
+                # Fallback: try custom provider alias from config.yaml providers section
+                _custom = _resolve_custom_provider(_provider_part)
+                if _custom and _custom.get("api_key"):
+                    logger.info(
+                        "delegate_task: resolved model provider '%s' via custom provider fallback",
+                        _provider_part,
+                    )
+                    creds = {
+                        "model": _model_part,
+                        "provider": _custom.get("provider", "custom"),
+                        "base_url": _custom.get("base_url"),
+                        "api_key": _custom["api_key"],
+                        "api_mode": _custom.get("api_mode"),
+                    }
+                else:
+                    return tool_error(
+                        f"Cannot resolve provider '{_provider_part}' for model parameter. "
+                        f"Not a built-in provider and not found in config.yaml providers section. "
+                        f"Check that the provider is configured (API key set, valid provider name)."
+                    )
+        else:
+            # No provider specified — just override the model name
+            creds["model"] = _model_part
+
     # Normalize to task list
     max_children = _get_max_concurrent_children()
     recovered_tasks, tasks_error = _recover_tasks_from_json_string(tasks)
@@ -2168,26 +2299,76 @@ def delegate_task(
             # Per-task role beats top-level; normalise again so unknown
             # per-task values warn and degrade to leaf uniformly.
             effective_role = _normalize_role(t.get("role") or top_role)
+
+            # Per-task model override: same logic as top-level model param.
+            task_creds = creds  # default: use resolved top-level creds
+            _task_model_raw = (t.get("model") or "").strip() or None
+            if _task_model_raw:
+                # Per-task model beats top-level
+                task_creds = dict(creds)  # shallow copy
+                if "/" in _task_model_raw:
+                    _tp, _tm = _task_model_raw.split("/", 1)
+                    _tp, _tm = _tp.strip(), _tm.strip()
+                    try:
+                        from hermes_cli.runtime_provider import resolve_runtime_provider
+                        _trt = resolve_runtime_provider(requested=_tp, target_model=_tm)
+                        _trt_key = _trt.get("api_key", "")
+                        if not _trt_key:
+                            return tool_error(
+                                f"Task {i} model provider '{_tp}' has no API key."
+                            )
+                        task_creds = {
+                            "model": _tm or _trt.get("model") or creds.get("model"),
+                            "provider": (
+                                _tp
+                                if _trt.get("provider") == _RUNTIME_PROVIDER_CUSTOM
+                                else _trt.get("provider")
+                            ),
+                            "base_url": _trt.get("base_url"),
+                            "api_key": _trt_key,
+                            "api_mode": _trt.get("api_mode"),
+                            "command": _trt.get("command"),
+                            "args": list(_trt.get("args") or []),
+                        }
+                    except Exception:
+                        # Fallback: try custom provider alias
+                        _tc = _resolve_custom_provider(_tp)
+                        if _tc and _tc.get("api_key"):
+                            task_creds = {
+                                "model": _tm,
+                                "provider": _tc.get("provider", "custom"),
+                                "base_url": _tc.get("base_url"),
+                                "api_key": _tc["api_key"],
+                                "api_mode": _tc.get("api_mode"),
+                            }
+                        else:
+                            return tool_error(
+                                f"Task {i} model provider '{_tp}' resolution failed: "
+                                f"not a built-in provider and not found in config.yaml."
+                            )
+                else:
+                    task_creds["model"] = _task_model_raw
+
             child = _build_child_agent(
                 task_index=i,
                 goal=t["goal"],
                 context=t.get("context"),
                 toolsets=t.get("toolsets") or toolsets,
-                model=creds["model"],
+                model=task_creds["model"],
                 max_iterations=effective_max_iter,
                 task_count=n_tasks,
                 parent_agent=parent_agent,
-                override_provider=creds["provider"],
-                override_base_url=creds["base_url"],
-                override_api_key=creds["api_key"],
-                override_api_mode=creds["api_mode"],
+                override_provider=task_creds["provider"],
+                override_base_url=task_creds["base_url"],
+                override_api_key=task_creds["api_key"],
+                override_api_mode=task_creds["api_mode"],
                 override_acp_command=t.get("acp_command")
                 or acp_command
-                or creds.get("command"),
+                or task_creds.get("command"),
                 override_acp_args=(
                     task_acp_args
                     if task_acp_args is not None
-                    else (acp_args if acp_args is not None else creds.get("args"))
+                    else (acp_args if acp_args is not None else task_creds.get("args"))
                 ),
                 role=effective_role,
                 # Per-task profile beats top-level; fallback to top-level profile.
@@ -2452,6 +2633,159 @@ def _resolve_child_credential_pool(effective_provider: Optional[str], parent_age
             exc,
         )
     return None
+
+
+def _resolve_custom_provider(provider_alias: str) -> Optional[dict]:
+    """Resolve a config.yaml custom provider alias to a credential bundle.
+
+    When ``resolve_runtime_provider`` does not recognise a provider name
+    (because it is a user-defined alias in config.yaml ``providers:`` rather
+    than a built-in Hermes provider), this function provides a fallback:
+
+    1. Look up ``providers.{alias}.base_url`` from config.yaml.
+    2. Look up the API key from auth.json ``credential_pool`` — trying both
+       ``custom:{alias}`` and the bare ``{alias}`` key.
+    3. Auto-detect ``api_mode`` from the base_url pattern.
+
+    If the exact alias is not found in config.yaml providers, a secondary
+    fallback scans all providers' base_urls for a domain keyword match
+    (e.g. ``bigmodel`` matches ``open.bigmodel.cn``).  This handles cases
+    where model_pool.json uses a domain-derived alias that differs from the
+    config.yaml provider key name.
+
+    Returns a dict with keys ``{base_url, api_key, api_mode, provider}`` on
+    success, or ``None`` if the alias cannot be resolved.
+    """
+    try:
+        from hermes_cli.config import load_config
+        from hermes_cli.runtime_provider import _detect_api_mode_for_url
+        from hermes_constants import get_hermes_home
+
+        # 1. Read config.yaml providers section
+        full_cfg = load_config()
+        providers_section = full_cfg.get("providers") or {}
+        provider_cfg = providers_section.get(provider_alias)
+
+        # 2. Fallback: domain keyword match across all providers
+        if not isinstance(provider_cfg, dict):
+            provider_cfg = None
+            alias_lower = provider_alias.lower().replace("-", "").replace("_", "")
+            # 2a: Known abbreviation aliases (model_pool.json → config.yaml key mapping)
+            _KNOWN_ALIASES = {
+                "ds": "deepseek",
+                "bigmodel": "zai",
+                "glm": "zai",
+                "ali": "bailian",
+                "tencent": "tencentcodingplan",
+                "volc": "volcengine",
+            }
+            _resolved_alias = _KNOWN_ALIASES.get(alias_lower)
+            if _resolved_alias and _resolved_alias in providers_section:
+                _pcfg = providers_section[_resolved_alias]
+                if isinstance(_pcfg, dict) and _pcfg.get("base_url"):
+                    provider_cfg = _pcfg
+                    logger.info(
+                        "delegate_task: custom provider '%s' resolved to '%s' via known alias",
+                        provider_alias, _resolved_alias,
+                    )
+            # 2b: Domain keyword match
+            if not isinstance(provider_cfg, dict):
+                for _pkey, _pcfg in providers_section.items():
+                    if not isinstance(_pcfg, dict):
+                        continue
+                    _bu = str(_pcfg.get("base_url", "") or "").lower()
+                    if not _bu:
+                        continue
+                    from urllib.parse import urlparse as _urlparse
+                    _domain = _urlparse(_bu).hostname or ""
+                    _domain_norm = _domain.lower().replace("-", "").replace(".", "")
+                    if alias_lower in _domain_norm or _domain_norm.startswith(alias_lower):
+                        provider_cfg = _pcfg
+                        logger.info(
+                            "delegate_task: custom provider '%s' matched to '%s' via domain keyword (domain=%s)",
+                            provider_alias, _pkey, _domain,
+                        )
+                        break
+
+        if not isinstance(provider_cfg, dict):
+            return None
+        base_url = str(provider_cfg.get("base_url", "") or "").strip()
+        if not base_url:
+            return None
+
+        # 3. Look up API key from auth.json credential_pool
+        api_key = None
+        # Try both profile auth.json and main HERMES_HOME auth.json
+        _home = get_hermes_home()
+        _main_home = _home
+        # Detect if we're in a profile: profile dirs are under profiles/ subdirectory
+        _home_str = str(_home).replace("\\", "/")
+        if "/profiles/" in _home_str:
+            _parts = _home_str.split("/profiles/")
+            _main_home_candidate = _home.__class__(_parts[0])
+            if (_main_home_candidate / "auth.json").is_file():
+                _main_home = _main_home_candidate
+
+        for _auth_dir in [_home, _main_home]:
+            auth_path = _auth_dir / "auth.json"
+            if not auth_path.is_file():
+                continue
+            import json as _json
+            with open(auth_path, "r", encoding="utf-8") as _af:
+                auth_data = _json.load(_af)
+            pool = auth_data.get("credential_pool") or {}
+            # Try multiple key patterns:
+            # "custom:{alias}", bare "{alias}", and also scan all keys for
+            # base_url domain match (same domain as the provider config)
+            from urllib.parse import urlparse as _urlparse
+            _target_domain = (_urlparse(base_url).hostname or "").lower()
+            _keys_to_try = [f"custom:{provider_alias}", provider_alias]
+            # Also add keys whose base_url matches the target domain
+            for _pool_key, _pool_entries in pool.items():
+                if not isinstance(_pool_entries, list) or not _pool_entries:
+                    continue
+                for _pe in _pool_entries:
+                    _pe_bu = str(_pe.get("base_url", "") or "").lower()
+                    if _pe_bu and _target_domain in _pe_bu:
+                        _keys_to_try.append(_pool_key)
+                        break
+
+            for _key in _keys_to_try:
+                entries = pool.get(_key)
+                if isinstance(entries, list) and entries:
+                    for entry in entries:
+                        _tok = entry.get("access_token", "")
+                        if _tok and entry.get("auth_type") != "none":
+                            api_key = _tok
+                            break
+                    if api_key:
+                        break
+            if api_key:
+                break
+
+        if not api_key:
+            logger.warning(
+                "delegate_task: custom provider '%s' has base_url but no API key "
+                "in credential_pool",
+                provider_alias,
+            )
+            return None
+
+        # 4. Auto-detect api_mode
+        api_mode = _detect_api_mode_for_url(base_url) or "chat_completions"
+
+        return {
+            "base_url": base_url,
+            "api_key": api_key,
+            "api_mode": api_mode,
+            "provider": "custom",
+        }
+    except Exception as exc:
+        logger.debug(
+            "delegate_task: custom provider alias resolution for '%s' failed: %s",
+            provider_alias, exc,
+        )
+        return None
 
 
 def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
@@ -2826,6 +3160,15 @@ DELEGATE_TASK_SCHEMA = {
                     "On update, pass an empty string to clear."
                 ),
             },
+            "model": {
+                "type": "string",
+                "description": (
+                    "Optional model override for the subagent. "
+                    "Format: 'provider/model' (e.g. 'bigmodel/glm-5-turbo') to use a specific "
+                    "provider, or just 'model-name' (e.g. 'glm-5-turbo') to keep the current "
+                    "provider. Takes precedence over delegation config and profile defaults."
+                ),
+            },
             "tasks": {
                 "type": "array",
                 "items": {
@@ -2866,6 +3209,14 @@ DELEGATE_TASK_SCHEMA = {
                             "type": "string",
                             "enum": ["leaf", "orchestrator"],
                             "description": "Per-task role override. See top-level 'role' for semantics.",
+                        },
+                        "model": {
+                            "type": "string",
+                            "description": (
+                                "Per-task model override. Format: 'provider/model' "
+                                "(e.g. 'bigmodel/glm-5-turbo') or just 'model-name'. "
+                                "Takes precedence over top-level model and profile defaults."
+                            ),
                         },
                     },
                     "required": ["goal"],
@@ -2925,6 +3276,7 @@ registry.register(
         acp_args=args.get("acp_args"),
         role=args.get("role"),
         profile=args.get("profile"),
+        model=args.get("model"),
         parent_agent=kw.get("parent_agent"),
     ),
     check_fn=check_delegate_requirements,
