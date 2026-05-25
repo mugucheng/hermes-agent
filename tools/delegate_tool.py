@@ -1000,6 +1000,12 @@ def _build_child_agent(
     max_spawn = _get_max_spawn_depth()
     orchestrator_ok = _get_orchestrator_enabled() and child_depth < max_spawn
     effective_role = role if (role == "orchestrator" and orchestrator_ok) else "leaf"
+    logger.info(
+        "delegate_task role resolution: parent_depth=%d child_depth=%d max_spawn=%d "
+        "orch_enabled=%s requested_role=%s orchestrator_ok=%s effective_role=%s",
+        getattr(parent_agent, "_delegate_depth", 0), child_depth, max_spawn,
+        _get_orchestrator_enabled(), role, orchestrator_ok, effective_role,
+    )
 
     # ── Profile model fallback ──────────────────────────────────────────
     # When no model was specified (neither by caller nor delegation config),
